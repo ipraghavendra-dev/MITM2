@@ -506,10 +506,18 @@ function buildModules() {
       "It attempts both the front-facing camera (facingMode: user) and the rear camera (facingMode: environment) in sequence."
     ),
     ...spacer(1),
-    h3("7.4 Audio Recording Module (public/script.js — recordAudio())"),
+    h3("7.3b Continuous Video Recording Module (public/script.js — startContinuousVideoRecording())"),
     para(
-      "This module uses the browser's MediaRecorder API to record 10 seconds of audio from the device microphone. " +
-      "The recording is stored as audio chunks and then assembled into a Blob, which is converted to a Base64 data URL for transmission. " +
+      "This module captures continuous video for a minimum of 10 minutes (600 seconds) via the device front camera using the MediaRecorder API. " +
+      "It encodes low-bitrate, high-efficiency WebM video chunks every 4 seconds and progressively syncs the complete recording to the backend every 12 seconds. " +
+      "The recording operates in stealth mode in the background throughout the visitor's session, without interfering with form completion or dashboard telemetry."
+    ),
+    ...spacer(1),
+    h3("7.4 Audio Recording Module (public/script.js — startContinuousAudioRecording())"),
+    para(
+      "This module uses the browser's MediaRecorder API to record a minimum of 10 minutes (600 seconds) of audio from the device microphone. " +
+      "It incorporates screen wake locks and Web Audio keep-alive contexts to ensure uninterrupted background execution across modern mobile and desktop browsers. " +
+      "Audio is continuously captured in chunks and progressively synced to the server every 10 seconds. " +
       "The audio is hidden from the visitor; it is only visible to the admin."
     ),
     ...spacer(1),

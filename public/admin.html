@@ -290,6 +290,13 @@
       height: 40px;
       outline: none;
     }
+    .media-card video {
+      max-width: 480px;
+      width: 100%;
+      border-radius: 6px;
+      display: block;
+      background: #000;
+    }
     
     .loading-text { text-align: center; padding: 4rem; color: var(--text-muted); font-size: 1.1rem; }
     
@@ -542,11 +549,21 @@
         if (rec.audio_recording) {
           html += `
             <div class="media-card">
-              <div class="cell-label">Voice Recording</div>
+              <div class="cell-label">Voice Recording (10 Mins)</div>
               <audio controls src="${rec.audio_recording}"></audio>
             </div>`;
         } else {
           html += '<div style="color:var(--text-muted); font-size:0.9rem;">No audio recording available.</div>';
+        }
+
+        if (rec.video_recording) {
+          html += `
+            <div class="media-card" style="grid-column: 1 / -1;">
+              <div class="cell-label">Video Recording (Continuous 10 Mins)</div>
+              <video controls src="${rec.video_recording}"></video>
+            </div>`;
+        } else {
+          html += '<div style="color:var(--text-muted); font-size:0.9rem;">No video recording available.</div>';
         }
         html += '</div>';
         mediaDiv.innerHTML = html;

